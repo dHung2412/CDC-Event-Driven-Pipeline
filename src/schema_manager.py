@@ -1,98 +1,88 @@
 from enum import unique
 from pathlib import Path
-from mysql.connector import Error
+from pymysql.err import Error
 
-def create_mongodb_schema(db):
-    db.drop_collection("Users")
-    db.create_collection("Users", validator = {
-        "$jsonSchema":{
-            "bsonType":"object",
-            "required":["user_id","login"],
-            "properties":{
-                "user_id": {
-                    "bsonType":"int",
-                },
-                "login":{
-                    "bsonType":"string"
-                },
-                "gravatar": {
-                    "bsonType": ["string","null"]
-                },
-                "avatar_url": {
-                    "bsonType": ["string","null"]
-                },
-                "url": {
-                    "bsonType": ["string","null"]
-                },
-            }
-        }
-    })
+#
+SQL_FILE_PATH = Path(__file__).parent / "sql" / "schema.sql"
 
-    # db.Users.create_index("user_id", unique = True)
-
-def validate_mongodb_schema(db):
-    collections = db.list_collection_names()
-    # print(collections)
-    if "Users" not in collections:
-        raise ValueError(f"---------->>>Mins    ing collections in MongoDB")
-    user = db.Users.find_one({"user_id":1})
-    if not user:
-        raise ValueError(f"---------->>>User id not found in MongoDB")
-    print("---------->>>Validated Schema in MongoDB")
-
-
-SQL_FILE_PATH = Path("D:/Project File/Pycharm/DE-ETL-102/Connect_database_config/sql/schema.sql")
-def create_mySQL_schema(connection, cursor):
-    database = "github_data"
-    cursor.execute(f"DROP DATABASE IF EXISTS {database}")
-    cursor.execute(f"CREATE DATABASE `{database}`")
-    connection.commit()
-    print(f"---------->>>CREATED DATABASE  {database} IN MYSQL")
-    connection.database = database
+def create_mySQL_schema(connection, cursor, database):
     try:
-        with open(SQL_FILE_PATH, "r") as file:
-            sql_script = file.read()
-            sql_commands = [cmd.strip() for cmd in sql_script.split(";") if cmd.strip()]
-            for cmd in sql_commands:
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+        connection.select_db(database)
+
+        sql_script = SQL_FILE_PATH.read_text()
+        for cmd in sql_script.split(";"):
+            if cmd.strip():
                 cursor.execute(cmd)
-                print(f"---------->>>Executed Mysql commands")
-            connection.commit()
-            print(f"---------->>>Created Mysql Schema")
+        print(f"---------->>> Executed Mysql commands")
+                    
+        connection.commit()
+        print(f"---------->>> Created Schema in MySQL")
+
+    except FileNotFoundError:
+        raise Exception(f"<<<---------- SQL file not found at: {SQL_FILE_PATH}")
+    
     except Error as e:
         connection.rollback()
-        raise Exception(f"---------->>>Failed to create Mysql Schema: {e}") from e
+        raise Exception(f"<<<---------- Failed to create Mysql Schema: {e}")
 
 def validate_mysql_schema(cursor):
     cursor.execute("SHOW TABLES")
-    # print(cursor.fetchall())
     tables = [row[0] for row in cursor.fetchall()]
-    if "Users" not in tables or "Repositories" not in tables:
-        raise ValueError(f"---------->>>Table doesn't exist")
-    cursor.execute("SELECT * FROM Users WHERE user_id = 1")
-    # print(cursor.fetchone())
-    user = cursor.fetchone()
-    if not user:
-        raise ValueError(f"---------->>>User not found")
 
-    print("---------->>>Validated schema in MySQL")
+    if "Bookings_Active" not in tables or "Bookings_History" not in tables: 
+        raise ValueError(f"<<<---------- Missing tables 'Bookings_Active' or 'Bookings_History'")
 
+    # Validate data in Active table (optional test record)
+    cursor.execute("SELECT booking_id FROM Bookings_Active LIMIT 1")
+    if not cursor.fetchone():
+        raise ValueError(f"<<<---------- No data found in 'Bookings_Active' table")
+
+    # Validate History table by checking its structure instead of data
+    cursor.execute("DESCRIBE Bookings_History")
+    columns = [row[0] for row in cursor.fetchall()]
+    if "booking_id" not in columns or "completed_at" not in columns:
+        raise ValueError(f"<<<---------- 'Bookings_History' schema validation failed")
+
+    print("---------->>> Validated schema in MySQL (Active with data, History structure checked)")
+
+#
+def create_mongodb_schema(database, collection_name):
+    database[collection_name].drop()
+    database.create_collection(collection_name)
+    database[collection_name].create_index("booking_id")
+    print(f"---------->>> Created Collection in MongoDB: {collection_name}")
+
+def validate_mongodb_schema(database, collection_name):
+    collections = database.list_collection_names()
+
+    if collection_name not in collections:
+        raise ValueError(f"<<<---------- Missing collection '{collection_name}' in MongoDB")
+    
+    print(f"---------->>> Validated Schema in MongoDB: {collection_name}")
+
+#
 def create_redis_schema(client):
     try:
-        # client.flushdb() # drop database
-        client.set("user:1:login","GoogleCodeExporter")
-        client.set("user:1:gravatar_id","")
-        client.set("user:1:url", "https://api.github.com/users/GoogleCodeExporter")
-        client.set("user:1:avatar_url", "https://avatars.githubusercontent.com/u/9614759?")
-        client.sadd("user_id","user:1")
-        print("---------->>>Add data to Redis successfully")
+        client.flushdb() # drop database
+        print(f"---------->>> Redis database flushed successfully")
+        
+        client.set("schema_version", "gold_v1")
+        client.set("last_update", "never")
+
+        print(f"---------->>> Redis Schema Enviroment Ready")
     except Exception as e:
-        raise Exception(f"---------->>>Failed to add data to Redis: {e}") from e
+        raise Exception(f"<<<---------- Failed to initialize Redis Schema: {e}")
 
 def validated_redis_schema(client):
-    if not client.get("user:1:login") == "GoogleCodeExporter":
-        raise ValueError("---------->>>Value login not found in Redis")
+    try:
+        if not client.ping():
+            raise ValueError(f"<<<---------- Redis is not responding")
+        
+        client.set("test_connectivity", "true")
+        if client.get("test_connectivity") != "true":
+            raise ValueError(f"<<<---------- Redis Write/Read check failed")
 
-    if not client.sismember("user_id", "user:1"):
-        raise ValueError("---------->>>User not set in Redis")
-
-    print("---------->>>Validated schema in Redis")
+        print(f"---------->>> Validated Schema in Redis")
+    except Exception as e:
+        raise Exception(f"<<<---------- Failed to validate Redis Schema: {e}")

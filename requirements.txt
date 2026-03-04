@@ -1,5 +1,5 @@
 mysql-connector-python
-pyspark
+pyspark==3.3.4
 kafka-python
 python-dotenv
 pymongo
@@ -7,3 +7,5 @@ redis
 findspark
 avro-python3
 fastparquet
+pymysql
+cryptography

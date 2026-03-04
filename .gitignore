@@ -1,0 +1,17 @@
+.venv/
+lib/
+__pycache__/
+*.pyc
+.env
+.idea/
+debug.txt
+tmp/
+*.log
+.DS_Store
+Docs_for_new_prj.md
+run_check.md
+system.md
+interview.md
+test.py
+.idea/
+lib/

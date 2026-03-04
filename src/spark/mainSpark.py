@@ -1,77 +1,116 @@
-from Connect_database_config.config.spark_config import SparkConnect
+from config.spark_config import SparkConnect, get_spark_config
 from pyspark.sql.types import *
-from pyspark.sql.functions import col, lit
-from Connect_database_config.src.spark.spark_write_data import SparkWriteDatabase
-from Connect_database_config.config.spark_config import get_spark_config
-
+from pyspark.sql.functions import col, to_timestamp, when, concat_ws, regexp_replace, coalesce, trim, regexp_extract, expr, lit, current_timestamp
+from spark.spark_write_data import SparkWriteDatabase
+import os
 
 def main():
-
-    package = [
+    # Setup
+    packages = [
         "mysql:mysql-connector-java:8.0.33",
         "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1"
     ]
 
-    spark_connect = SparkConnect(
-        app_name = 'hungbo',
-        master_url = "local[*]",
-        executor_memory = "2g",
-        executor_cores = 2,
-        driver_memory = "2g",
-        num_executor = 2,
-        jar_packages = package,
-        # spark_conf = spark_conf,
-        log_level = "INFO"
-    ).spark
-
-    schema = StructType([
-        StructField( 'actor', StructType([
-            StructField( 'id', IntegerType(), False),
-            StructField('login', StringType(),  True),
-            StructField('gravatar_id', StringType(), True),
-            StructField( 'url', StringType(), True),
-            StructField( 'avatar_url', StringType(), True),
-        ]), True),
-        StructField( 'repo', StructType([
-            StructField('id', LongType(), False),
-            StructField( 'name', StringType(), True),
-            StructField('url', StringType(), True)
-        ]),True)
-    ])
-
-
-    df = spark_connect.read.schema(schema).json(r"D:\Project File\Pycharm\DE-ETL-102\Connect_database_config\data\2015-03-01-17.json")
-
-    df_write_table = df.withColumn("spark_temp", lit("sparkwrite")).select(
-        col('actor.id').alias('user_id')
-            ,col('actor.login').alias('login')
-            ,col('actor.gravatar_id').alias('gravatar_id')
-            ,col('actor.avatar_url').alias('avatar_url')
-            ,col('actor.url').alias('url')
-            ,col('spark_temp').alias("spark_temp")
+    spark_manager = SparkConnect(
+        app_name='Logistic_ETL_Spark',
+        master_url="local[*]",
+        jar_packages=packages,
+        log_level="WARN"
     )
-    # df_write_table.show()
+    print("_______________ Spark Session Started _______________")
+    spark = spark_manager.spark
 
-    # df_write_table_Repositories = df.select(
-    #     col('repo.id').alias('repo_id')
-    #         ,col('repo.name').alias('name')
-    #         ,col('repo.url').alias('url')
-    # )
-    # df_write_table.printSchema()
+    # Data Path
+    csv_path = r"D:\Project\Data_Engineering\DE_ETL\src\data\logistic_data.csv"
 
-    spark_config = get_spark_config()
-    df_write = SparkWriteDatabase(spark_connect, spark_config)
-    df_write.write_all_database(df_write_table, mode="append")
+    # Read CSV
+    df_raw = spark.read.option("header", "true").csv(csv_path)
 
-    df_validate = SparkWriteDatabase(spark_connect, spark_config)
-    # df_validate.validate_spark_mysql(df_write_table,db_configs["mysql"]["table"], db_configs["mysql"]["jdbc_url"],db_configs["mysql"]["config"])
-    # df_validate.validate_spark_mongodb(df_write_table, db_configs["mongodb"]["uri"],db_configs["mongodb"]["database"],db_configs["mongodb"]["collection"])
-    df_validate.validate_spark(df_write_table, mode="append")
+    # Data Transformation
+    print("_______________ Data Transformation _______________")
+    df_transformed = df_raw.select(
+        col("Booking ID").alias("booking_id"),
+        col("Shipment Type").alias("shipment_type"),
+        col("Booking Date").alias("booking_date"),
+        col("Vehicle Registration").alias("vehicle_no"),
+        col("Vehicle Type").alias("vehicle_type"),
+        col("Origin Location").alias("origin"),
+        col("Destination Location").alias("destination"),
+        col("Planned ETA").alias("planned_eta"),
+        col("Actual ETA").alias("actual_eta"),
+        col("Ontime").alias("ontime"),
+        col("Trip Start Date").alias("trip_start"),
+        col("Trip End Date").alias("trip_end"),
+        col("Transportation Distance (KM)").alias("distance_km"),
+        col("Driver Name").alias("driver_name"),
+        col("Driver Mobile No").alias("driver_mobile"),
+        col("Customer Name").alias("customer"),
+        col("Supplier Name").alias("supplier"),
+        col("Material Shipped").alias("material")
+    )
 
-    print("---------->>>Read data success")
+    # --- 1
+    df_cleaned = df_transformed.withColumn("trip_end_clean", regexp_replace(col("trip_end"), r"[A-Za-z]", "")) \
+    .withColumn("trip_end_clean",regexp_replace(col("trip_end_clean"), r":+", ":")) \
+    .withColumn("trip_end_clean",(regexp_replace(col("trip_end_clean"), r"\s+", " ")))
 
-    spark_connect.stop()
+    df_cleaned = df_cleaned.withColumn("p_hours", lit(12)) \
+    .withColumn("p_minutes", regexp_extract(col("planned_eta"), r"(\d+):(\d+)", 1).cast("int")) \
+    .withColumn("p_seconds", regexp_extract(col("planned_eta"), r"(\d+):(\d+)", 2).cast("int"))
+
+    # --- 2
+    
+    def parse_dt(col):
+        return coalesce(
+            to_timestamp(col, "M/d/yyyy H:mm"),
+            to_timestamp(col, "M/d/yyyy H:mm:ss"),
+            to_timestamp(col, "M/d/yyyy h:mm a"),
+            to_timestamp(col, "M/d/yyyy h:mm:ss a"),
+            to_timestamp(col, "yyyy-MM-dd HH:mm:ss")
+        )
+
+    # planned_eta = booking_date (00:00) + (12h + p_minutes + p_seconds)
+    df_parsed_data = df_cleaned \
+    .withColumn("booking_date_ts", to_timestamp(col("booking_date"), "M/d/yyyy")) \
+    .withColumn("trip_start", parse_dt(col("trip_start"))) \
+    .withColumn("trip_end", parse_dt(col("trip_end_clean"))) \
+    .withColumn("actual_eta", parse_dt(col("actual_eta"))) \
+    .withColumn("planned_eta", expr("booking_date_ts + make_interval(0,0,0,0, p_hours, coalesce(p_minutes,0), coalesce(p_seconds,0))")) \
+    .withColumn("ontime", when(col("ontime") == "Yes", True).otherwise(False)) \
+    .withColumn("distance_km", col("distance_km").cast(IntegerType())) \
+    .fillna(0, subset=["distance_km"])
+
+    df_final_data = df_parsed_data.withColumn("booking_date", col("booking_date_ts"))
+
+    # --- 3
+    base_cols = [
+        "booking_id", "shipment_type", "booking_date", "vehicle_no", "vehicle_type",
+        "origin", "destination", "planned_eta", "actual_eta", "ontime",
+        "trip_start", "trip_end", "distance_km", "driver_name", "driver_mobile",
+        "customer", "supplier", "material"
+    ]
+    # --- Deduplicate
+    df_final = df_final_data.select(*base_cols).dropDuplicates(["booking_id"])
+
+    # --- Split data
+    df_active = df_final.filter(col("trip_end").isNull()).withColumn("updated_at", current_timestamp())
+
+    df_history = df_final.filter(col("trip_end").isNotNull())
+
+    print(f"---------->>> [DEBUG]: Stats - Active: {df_active.count()} | History: {df_history.count()}")
+
+    # --- Write to Databases
+    spark_conf = get_spark_config() 
+    db_writer = SparkWriteDatabase(spark, spark_conf)
+    
+    db_writer.write_all(df_active, df_history)
+
+    print(f"_______________ETL Summary_______________")
+    print(f"_____Total Records: {df_final.count()}_____")
+    print(f"_____Active Records: {df_active.count()}_____")
+    print(f"_____History Records: {df_history.count()}_____")
+
+    spark_manager.stop()
 
 if __name__ == "__main__":
     main()
-
