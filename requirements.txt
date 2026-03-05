@@ -9,3 +9,4 @@ avro-python3
 fastparquet
 pymysql
 cryptography
+requests

@@ -6,13 +6,17 @@ import os
 
 def main():
     # Setup
+    # packages = [
+    #     "mysql:mysql-connector-java:8.0.33",
+    #     "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1"
+    # ]
+
     packages = [
         "mysql:mysql-connector-java:8.0.33",
-        "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1"
     ]
 
     spark_manager = SparkConnect(
-        app_name='Logistic_ETL_Spark',
+        app_name='Logistic_ETL',
         master_url="local[*]",
         jar_packages=packages,
         log_level="WARN"
@@ -31,17 +35,26 @@ def main():
     df_transformed = df_raw.select(
         col("Booking ID").alias("booking_id"),
         col("Shipment Type").alias("shipment_type"),
-        col("Booking Date").alias("booking_date"),
+        col("Booking Date").alias("booking_date_raw"),
         col("Vehicle Registration").alias("vehicle_no"),
         col("Vehicle Type").alias("vehicle_type"),
         col("Origin Location").alias("origin"),
         col("Destination Location").alias("destination"),
-        col("Planned ETA").alias("planned_eta"),
-        col("Actual ETA").alias("actual_eta"),
-        col("Ontime").alias("ontime"),
-        col("Trip Start Date").alias("trip_start"),
-        col("Trip End Date").alias("trip_end"),
-        col("Transportation Distance (KM)").alias("distance_km"),
+        col("Origin Location Latitude").cast("double").alias("lat_origin"),
+        col("Origin Location Longitude").cast("double").alias("long_origin"),
+        col("Destination Location Latitude").cast("double").alias("lat_destination"),
+        col("Destination Location Longitude").cast("double").alias("long_destination"),
+        col("Gps Provider").alias("gps_provider"),
+        col("Data Ping time").alias("data_ping_time"),
+        col("Current Location Latitude").cast("double").alias("current_lat"),
+        col("Curren Location Longitude").cast("double").alias("current_long"),
+        col("Planned ETA").alias("planned_eta_raw"),
+        col("Actual ETA").alias("actual_eta_raw"),
+        col("Ontime").alias("ontime_raw"),
+        col("Trip Start Date").alias("trip_start_raw"),
+        col("Trip End Date").alias("trip_end_raw"),
+        col("Transportation Distance (KM)").cast("int").alias("distance_km"),
+        col("Minimum Kms To Be Covered In A Day").cast("int").alias("min_kms_day"),
         col("Driver Name").alias("driver_name"),
         col("Driver Mobile No").alias("driver_mobile"),
         col("Customer Name").alias("customer"),
@@ -49,67 +62,61 @@ def main():
         col("Material Shipped").alias("material")
     )
 
-    # --- 1
-    df_cleaned = df_transformed.withColumn("trip_end_clean", regexp_replace(col("trip_end"), r"[A-Za-z]", "")) \
-    .withColumn("trip_end_clean",regexp_replace(col("trip_end_clean"), r":+", ":")) \
-    .withColumn("trip_end_clean",(regexp_replace(col("trip_end_clean"), r"\s+", " ")))
-
-    df_cleaned = df_cleaned.withColumn("p_hours", lit(12)) \
-    .withColumn("p_minutes", regexp_extract(col("planned_eta"), r"(\d+):(\d+)", 1).cast("int")) \
-    .withColumn("p_seconds", regexp_extract(col("planned_eta"), r"(\d+):(\d+)", 2).cast("int"))
-
-    # --- 2
-    
-    def parse_dt(col):
+    def parse_dt(c):
         return coalesce(
-            to_timestamp(col, "M/d/yyyy H:mm"),
-            to_timestamp(col, "M/d/yyyy H:mm:ss"),
-            to_timestamp(col, "M/d/yyyy h:mm a"),
-            to_timestamp(col, "M/d/yyyy h:mm:ss a"),
-            to_timestamp(col, "yyyy-MM-dd HH:mm:ss")
+            to_timestamp(c, "M/d/yyyy H:mm"),
+            to_timestamp(c, "M/d/yyyy h:mm a"),
+            to_timestamp(c, "M/d/yyyy h:mm:ss a"),
+            to_timestamp(c, "yyyy-MM-dd HH:mm:ss")
         )
 
-    # planned_eta = booking_date (00:00) + (12h + p_minutes + p_seconds)
-    df_parsed_data = df_cleaned \
-    .withColumn("booking_date_ts", to_timestamp(col("booking_date"), "M/d/yyyy")) \
-    .withColumn("trip_start", parse_dt(col("trip_start"))) \
-    .withColumn("trip_end", parse_dt(col("trip_end_clean"))) \
-    .withColumn("actual_eta", parse_dt(col("actual_eta"))) \
-    .withColumn("planned_eta", expr("booking_date_ts + make_interval(0,0,0,0, p_hours, coalesce(p_minutes,0), coalesce(p_seconds,0))")) \
-    .withColumn("ontime", when(col("ontime") == "Yes", True).otherwise(False)) \
-    .withColumn("distance_km", col("distance_km").cast(IntegerType())) \
-    .fillna(0, subset=["distance_km"])
+    # 1. Clean Trip End Date (often has artifacts)
+    df_cleaned = df_transformed.withColumn("trip_end_clean", regexp_replace(col("trip_end_raw"), r"[A-Za-z]", "")) \
+        .withColumn("trip_end_clean", regexp_replace(col("trip_end_clean"), r":+", ":")) \
+        .withColumn("trip_end_clean", trim(regexp_replace(col("trip_end_clean"), r"\s+", " ")))
 
-    df_final_data = df_parsed_data.withColumn("booking_date", col("booking_date_ts"))
+    # 2. Process timestamps
+    df_parsed = df_cleaned \
+        .withColumn("booking_date", to_timestamp(col("booking_date_raw"), "M/d/yyyy")) \
+        .withColumn("trip_start", parse_dt(col("trip_start_raw"))) \
+        .withColumn("trip_end", parse_dt(col("trip_end_clean"))) \
+        .withColumn("actual_eta", parse_dt(col("actual_eta_raw"))) \
+        .withColumn("ontime", when(col("ontime_raw") == "Yes", True).otherwise(False)) \
+        .withColumn("distance_km", col("distance_km").cast(IntegerType()))
 
-    # --- 3
+    # 3. Special Logic for Planned ETA (Booking Date + Planned Time)
+    df_parsed = df_parsed \
+        .withColumn("p_hour_str", regexp_extract(col("planned_eta_raw"), r"(\d+):", 1)) \
+        .withColumn("p_min_str", regexp_extract(col("planned_eta_raw"), r":(\d+)", 1)) \
+        .withColumn("p_period", regexp_extract(col("planned_eta_raw"), r"(AM|PM)", 1)) \
+        .withColumn("p_hour", col("p_hour_str").cast("int")) \
+        .withColumn("p_hour_24", when(col("p_period") == "PM", col("p_hour") + 12).otherwise(col("p_hour"))) \
+        .withColumn("planned_eta", expr("booking_date + make_interval(0,0,0,0, coalesce(p_hour_24,0), coalesce(p_min_str,0), 0)"))
+
+    # 4. Final Selection and Deduplication
     base_cols = [
         "booking_id", "shipment_type", "booking_date", "vehicle_no", "vehicle_type",
-        "origin", "destination", "planned_eta", "actual_eta", "ontime",
-        "trip_start", "trip_end", "distance_km", "driver_name", "driver_mobile",
-        "customer", "supplier", "material"
+        "origin", "destination", "lat_origin", "long_origin", "lat_destination", "long_destination",
+        "distance_km", "gps_provider", "data_ping_time", "current_lat", "current_long",
+        "planned_eta", "actual_eta", "ontime", "trip_start", "trip_end",
+        "driver_name", "driver_mobile", "customer", "supplier", "material", "min_kms_day"
     ]
-    # --- Deduplicate
-    df_final = df_final_data.select(*base_cols).dropDuplicates(["booking_id"])
+    
+    df_final = df_parsed.select(*base_cols).dropDuplicates(["booking_id"])
 
-    # --- Split data
+    # 5. Split and Add Audit Columns
     df_active = df_final.filter(col("trip_end").isNull()).withColumn("updated_at", current_timestamp())
-
     df_history = df_final.filter(col("trip_end").isNotNull())
 
     print(f"---------->>> [DEBUG]: Stats - Active: {df_active.count()} | History: {df_history.count()}")
 
-    # --- Write to Databases
+    # 6. Write to MySQL (Transactional Layer)
     spark_conf = get_spark_config() 
     db_writer = SparkWriteDatabase(spark, spark_conf)
     
     db_writer.write_all(df_active, df_history)
 
-    print(f"_______________ETL Summary_______________")
-    print(f"_____Total Records: {df_final.count()}_____")
-    print(f"_____Active Records: {df_active.count()}_____")
-    print(f"_____History Records: {df_history.count()}_____")
-
+    print("_______________ Data pushed to MySQL Binlog Source _______________")
     spark_manager.stop()
 
 if __name__ == "__main__":
